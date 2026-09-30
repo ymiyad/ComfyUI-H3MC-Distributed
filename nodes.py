@@ -51,6 +51,11 @@ from safetensors.torch import save as _st_save_bytes, load as _st_load_bytes
 from . import _store
 
 try:
+    from comfy.cli_args import args as _comfy_args
+except ImportError:
+    _comfy_args = None
+
+try:
     import av as _av
 except ImportError:
     _av = None
@@ -239,6 +244,11 @@ class H3MotionContextSaveVideoWithLatent:
     by accident, or lose track of. To continue the chain, point
     H3 Motion Context Load Latent From Video at this exact file.
 
+    The saved file also carries the same "prompt"/"workflow" metadata
+    core ComfyUI Save Video writes, so it's draggable back into ComfyUI
+    to restore the graph, and is skipped the same way under
+    --disable-metadata.
+
     Re-encoding, transcoding, or re-muxing the saved file elsewhere will
     strip this metadata -- keep the original around for as long as you
     might want to continue the chain from it."""
@@ -257,7 +267,7 @@ class H3MotionContextSaveVideoWithLatent:
                 "filename_prefix": ("STRING", {"default": "h3_chain/clip"}),
                 "format": (["mp4", "mkv", "webm"], {"default": "mp4"}),
             },
-            "hidden": {"prompt": "PROMPT"},
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
     RETURN_TYPES = ("VIDEO", "STRING")
@@ -271,7 +281,7 @@ class H3MotionContextSaveVideoWithLatent:
         "continuation state."
     )
 
-    def save(self, video, participant_index, filename_prefix, format="mp4", prompt=None):
+    def save(self, video, participant_index, filename_prefix, format="mp4", prompt=None, extra_pnginfo=None):
         if _av is None:
             raise RuntimeError(
                 "h3_motion_context_video: PyAV ('av') is not available."
@@ -328,7 +338,32 @@ class H3MotionContextSaveVideoWithLatent:
         file = f"{filename}_{counter:05}_.{format}"
         path = os.path.join(full_folder, file)
 
-        save_kwargs = {"metadata": {_H3_VIDEO_LATENT_METADATA_KEY: b64}}
+        # Same metadata shape ComfyUI's own Save Video node writes
+        # (comfy_extras/nodes_video.py): "prompt" plus every extra_pnginfo
+        # key (typically "workflow"), passed as RAW objects, not
+        # pre-JSON-encoded. video.save_to() (VideoFromComponents.save_to,
+        # specifically) always runs json.dumps() itself on every metadata
+        # value it's given, even ones that are already strings -- so
+        # pre-encoding here would double-encode prompt/workflow into a
+        # JSON string containing a JSON string, which ComfyUI's own
+        # drag-and-drop workflow loader can't parse back into a real
+        # object. Passing raw dict values here (matching core exactly)
+        # means save_to() JSON-encodes them exactly once. Skipped under
+        # --disable-metadata, same as core.
+        metadata = {}
+        if _comfy_args is None or not getattr(_comfy_args, "disable_metadata", False):
+            if extra_pnginfo is not None:
+                metadata.update(extra_pnginfo)
+            if prompt is not None:
+                metadata["prompt"] = prompt
+        # Our own H3 latent key rides alongside prompt/workflow. It's
+        # already a string (base64), but save_to() will run json.dumps()
+        # on it too (wrapping it in quotes) -- H3MotionContextLoadLatent
+        # FromVideo below undoes that with a json.loads() attempt before
+        # base64-decoding, so this round-trips regardless of which
+        # save_to() code path ends up handling it.
+        metadata[_H3_VIDEO_LATENT_METADATA_KEY] = b64
+        save_kwargs = {"metadata": metadata}
         if _ComfyVideoTypes is not None:
             save_kwargs["format"] = _ComfyVideoTypes.VideoContainer(format)
         else:
@@ -429,11 +464,11 @@ class H3MotionContextLoadLatentFromVideo:
 
         container = _av.open(p)
         try:
-            b64 = container.metadata.get(_H3_VIDEO_LATENT_METADATA_KEY)
+            raw_tag = container.metadata.get(_H3_VIDEO_LATENT_METADATA_KEY)
         finally:
             container.close()
 
-        if not b64:
+        if not raw_tag:
             raise ValueError(
                 "h3_motion_context_video: %s has no embedded H3 latent "
                 "(missing '%s' metadata tag). Was it saved by H3 Motion "
@@ -441,6 +476,19 @@ class H3MotionContextLoadLatentFromVideo:
                 "it been re-encoded/re-muxed since?"
                 % (p, _H3_VIDEO_LATENT_METADATA_KEY)
             )
+
+        # video.save_to() always runs json.dumps() on every metadata
+        # value on at least one of its code paths, so our base64 string
+        # usually comes back JSON-quoted (e.g. '"<base64>..."'). Undo
+        # that if present; fall back to the raw tag for files written
+        # via a save_to() path that left plain strings alone.
+        b64 = raw_tag
+        try:
+            unwrapped = json.loads(raw_tag)
+            if isinstance(unwrapped, str):
+                b64 = unwrapped
+        except (TypeError, ValueError):
+            pass
 
         payload = base64.b64decode(b64)
         data = _st_load_bytes(payload)
