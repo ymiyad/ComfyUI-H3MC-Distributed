@@ -1,1 +1,1 @@
-# ComfyUI-H3-Motion-Context-Distributed
+# ComfyUI-H3MC-Distributed
