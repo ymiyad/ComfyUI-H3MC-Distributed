@@ -84,6 +84,10 @@ Because the video lives in `ComfyUI/input/`, ComfyUI-Distributed ships it to eve
 
 All three nodes also work with no Distributed graph at all: `Upload Latent` just stores locally, `Save Video With Latent` defaults to `participant_index = 1` (its own local slot), and `Load Latent From Video` works exactly the same way. This is a convenient way to switch a single-machine chain over to the "one file is the continuation state" model even if you never plan to distribute it.
 
+### Example workflow
+
+[`workflows/video_H3MC_Distributed_r2v_sample.json`](workflows/video_H3MC_Distributed_r2v_sample.json) is a working reference-to-video (ref2va) round wired up per the loop above: `Distributed Seed` → sampler → `H3 Motion Context Upload Latent` → `Distributed Collector` → `Image Batch Divider` → `Create Video` → `H3 Motion Context Save Video With Latent` per candidate, plus `H3 Motion Context Load Latent From Video` feeding the next round's context. Load it in ComfyUI to see the full graph.
+
 ## Node reference
 
 | Node | Where it runs | Key inputs | Output |
