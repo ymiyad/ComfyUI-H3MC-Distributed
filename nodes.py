@@ -346,7 +346,13 @@ class H3MotionContextSaveVideoWithLatent:
 
         print(f"[H3MotionContextSaveVideoWithLatent] saved {path} "
               f"(embedded latent: {len(payload)} bytes)")
-        return (video, rel_path)
+
+        # Same UI payload shape ComfyUI's own Save Video node returns
+        # (comfy_extras/nodes_video.py, PreviewVideo.as_dict()), so this
+        # node gets the same inline video-preview/playback widget.
+        preview = {"images": [{"filename": file, "subfolder": subfolder, "type": "output"}],
+                   "animated": (True,)}
+        return {"ui": preview, "result": (video, rel_path)}
 
 
 class H3MotionContextLoadLatentFromVideo:
