@@ -91,6 +91,106 @@ def _h3_streams_from_latent(latent):
     return parts
 
 
+# --- Keeping only the tail of the latent ------------------------------------
+#
+# H3 Motion Context reads only the END of context_latent: at most 56 pixel
+# frames of video (its context_length widget) and audio_context_length frames
+# of audio, both end-aligned. Storing the whole clip's latent made the saved
+# video ~6x bigger than needed (a 15 s, 2 MP clip carried an 84 MB latent,
+# ~112 MB once base64-encoded) and pushed uploads past 100 MB request limits.
+#
+# The tail we keep must look, to H3's slicing code, exactly like the tail of
+# the full latent:
+#   * video steps cover pixel frames in a repeating 1, 4, 4, 4, 4 pattern and
+#     H3 counts that pattern from step 0, so the cut must remove a multiple of
+#     5 steps (17 frames each) to keep every kept step at its original phase;
+#   * H3 derives the audio grid's overhang from the video length
+#     (audio_steps - 5/3 * frames), so audio must lose exactly 5/3 of the
+#     removed frames -- a whole number only when 3 * 17 = 51 frames, i.e. 15
+#     video steps / 85 audio steps, are removed at a time.
+# With those two held, every H3 window no longer than the kept tail slices to
+# bit-identical blocks, offsets and audio placement.
+
+_VIDEO_FRAMES_PER_STEP = (1, 4, 4, 4, 4)
+_TRIM_STEP_UNIT = 15          # video steps removed per cut unit
+_TRIM_FRAME_UNIT = 51         # pixel frames in those 15 steps
+_TRIM_AUDIO_UNIT = 85         # 40 Hz audio steps in those 51 frames (51 * 5/3)
+DEFAULT_KEEP_TAIL_FRAMES = 56  # H3 Motion Context's largest context_length
+
+
+def _h3_pixel_frames(video_steps):
+    return sum(_VIDEO_FRAMES_PER_STEP[k % 5] for k in range(int(video_steps)))
+
+
+def _h3_time_axis(video):
+    # [B, C, T, H, W] or unbatched [C, T, H, W]
+    return video.ndim - 3
+
+
+def trim_h3_latent_tail(video, audio, keep_frames=DEFAULT_KEEP_TAIL_FRAMES):
+    """Drop the head of an H3 AV latent, keeping at least `keep_frames`
+    pixel frames (video and audio) at the end.
+
+    Returns (video, audio, info). The tensors are returned untouched (and
+    info["trimmed"] is False) when keep_frames <= 0, when the latent is
+    already short enough, or when its shape is not the H3 layout this
+    relies on -- never a latent H3 would slice differently."""
+    info = {"trimmed": False, "reason": "", "video_steps": None, "audio_steps": None}
+    if keep_frames is None or int(keep_frames) <= 0:
+        info["reason"] = "disabled"
+        return video, audio, info
+    if video.ndim not in (4, 5) or audio.ndim not in (3, 4):
+        info["reason"] = "unexpected shapes %s / %s" % (tuple(video.shape), tuple(audio.shape))
+        return video, audio, info
+
+    t_axis = _h3_time_axis(video)
+    total_steps = int(video.shape[t_axis])
+    total_audio = int(audio.shape[-1])
+    info["video_steps"] = (total_steps, total_steps)
+    info["audio_steps"] = (total_audio, total_audio)
+    if total_steps % 5 != 2:
+        info["reason"] = "video length %d steps is not a whole H3 clip (5g+2)" % total_steps
+        return video, audio, info
+    overhang = total_audio - 5.0 / 3.0 * _h3_pixel_frames(total_steps)
+    if not (-0.5 < overhang < 0.5):
+        info["reason"] = "audio grid (%d steps) does not match the video" % total_audio
+        return video, audio, info
+
+    # Shortest 5g+2-step tail covering keep_frames, then grow it until the
+    # removed part is a whole number of 15-step units.
+    keep_steps = 2
+    while _h3_pixel_frames(keep_steps) < int(keep_frames):
+        keep_steps += 5
+    keep_steps += (total_steps - keep_steps) % _TRIM_STEP_UNIT
+    if keep_steps >= total_steps:
+        info["reason"] = "already within the kept tail"
+        return video, audio, info
+
+    units = (total_steps - keep_steps) // _TRIM_STEP_UNIT
+    cut_audio = units * _TRIM_AUDIO_UNIT
+    if cut_audio >= total_audio:
+        info["reason"] = "audio shorter than the cut"
+        return video, audio, info
+
+    index = [slice(None)] * video.ndim
+    index[t_axis] = slice(total_steps - keep_steps, None)
+    video_tail = video[tuple(index)].contiguous().clone()
+    audio_tail = audio[..., cut_audio:].contiguous().clone()
+
+    # Belt and braces: the invariants H3 checks must hold on the result.
+    kept_frames = _h3_pixel_frames(keep_steps)
+    assert _h3_pixel_frames(total_steps) - kept_frames == units * _TRIM_FRAME_UNIT
+    assert abs((int(audio_tail.shape[-1]) - 5.0 / 3.0 * kept_frames) - overhang) < 1e-6
+
+    info.update(
+        trimmed=True,
+        video_steps=(total_steps, keep_steps),
+        audio_steps=(total_audio, int(audio_tail.shape[-1])),
+        kept_frames=kept_frames,
+    )
+    return video_tail, audio_tail, info
+
+
 _MASTER_STORE_IDX = -1  # sentinel: Master's own candidate (never collides
                         # with a worker_position, which is always >= 0)
 
@@ -160,6 +260,18 @@ class H3MotionContextUploadLatent:
     def INPUT_TYPES(cls):
         return {
             "required": {"latent": ("LATENT",)},
+            "optional": {
+                "keep_tail_frames": ("INT", {
+                    "default": DEFAULT_KEEP_TAIL_FRAMES, "min": 0, "max": 100000, "step": 1,
+                    "tooltip": "Frames at the end of the clip to keep for "
+                               "continuing the chain (video and audio). H3 "
+                               "Motion Context only reads the tail: 56 covers "
+                               "its largest context_length. Raise it if the next "
+                               "clip uses an audio_context_length above this. "
+                               "0 keeps the whole latent (old behavior, much "
+                               "larger files).",
+                }),
+            },
             "hidden": {"prompt": "PROMPT"},
         }
 
@@ -172,12 +284,23 @@ class H3MotionContextUploadLatent:
         "participant's identity. No shared folder needed."
     )
 
-    def run(self, latent, prompt=None):
+    def run(self, latent, keep_tail_frames=DEFAULT_KEEP_TAIL_FRAMES, prompt=None):
         ctx = _h3_distributed_context(prompt)
         video_t, audio_t = _h3_streams_from_latent(latent)[:2]
+        # Only the copy handed to Master is trimmed; the pass-through output
+        # below is the untouched latent for this clip's own decode.
+        video_t, audio_t, trim = trim_h3_latent_tail(
+            video_t.cpu(), audio_t.cpu(), keep_tail_frames)
+        if trim["trimmed"]:
+            print(f"[H3MotionContextUploadLatent] keeping the last "
+                  f"{trim['kept_frames']} frames for the chain: video "
+                  f"{trim['video_steps'][0]}->{trim['video_steps'][1]} steps, "
+                  f"audio {trim['audio_steps'][0]}->{trim['audio_steps'][1]} steps")
+        elif trim["reason"] not in ("disabled", "already within the kept tail"):
+            print(f"[H3MotionContextUploadLatent] keeping the whole latent: {trim['reason']}")
         payload = _st_save_bytes({
-            "video": video_t.cpu().contiguous(),
-            "audio": audio_t.cpu().contiguous(),
+            "video": video_t.contiguous(),
+            "audio": audio_t.contiguous(),
         })
 
         if ctx is None or not ctx["is_worker"]:
