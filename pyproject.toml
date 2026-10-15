@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-h3mc-distributed"
+description = "Candidate racing for ComfyUI-H3-Motion-Context on ComfyUI-Distributed: workers generate alternative takes of the next clip in parallel, Master saves each with its latent embedded, and the chosen take continues the chain."
+version = "0.0.2"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# torch / safetensors are provided by ComfyUI itself; listing them here could trigger an unwanted reinstall.
+dependencies = ["av"]
+
+[project.urls]
+Repository = "https://github.com/ymiyad/ComfyUI-H3MC-Distributed"
+"Bug Tracker" = "https://github.com/ymiyad/ComfyUI-H3MC-Distributed/issues"
+
+[tool.comfy]
+PublisherId = "ymiyad"
+DisplayName = "ComfyUI-H3MC-Distributed"
+Icon = ""
+includes = []
